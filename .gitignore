@@ -1,0 +1,57 @@
+# -----------------------------
+# Node.js
+# -----------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# -----------------------------
+# Environment variables
+# -----------------------------
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# -----------------------------
+# Firebase / Google credentials
+# -----------------------------
+serviceAccountKey.json
+serviceAccountKey*.json
+firebase-debug.log
+firestore-debug.log
+
+# -----------------------------
+# Logs
+# -----------------------------
+logs/
+*.log
+
+# -----------------------------
+# OS / Editor files
+# -----------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# -----------------------------
+# Build / Cache
+# -----------------------------
+dist/
+build/
+.cache/
+.tmp/
+
+# -----------------------------
+# Coverage
+# -----------------------------
+coverage/
+
+# -----------------------------
+# Optional (if using uploads)
+# -----------------------------
+uploads/

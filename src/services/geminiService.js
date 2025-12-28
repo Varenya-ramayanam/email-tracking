@@ -1,6 +1,7 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const dotenv = require("dotenv");
 
-const genAI = new GoogleGenerativeAI("AIzaSyAtp78eL1ZiLTR6MNusRgy46KV-enABUfU");
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // This is a Temporary Mock Service to bypass the 404 errors
 const analyzeInterviewDetails = async (emailText) => {

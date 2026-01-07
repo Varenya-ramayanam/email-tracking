@@ -14,6 +14,11 @@ app.use(express.json());
 app.post('/api/process-emails', processUserEmails);
 
 const PORT = process.env.PORT || 5000;
+
+app.get("/",(req,res)=>{
+  res.send("Server running!!");
+})
+
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
 }); 

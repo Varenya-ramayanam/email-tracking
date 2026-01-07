@@ -6,134 +6,102 @@ const { addToCalendar } = require('../services/calendarService');
 
 const processUserEmails = async (req, res) => {
   const { accessToken, userId } = req.body;
+  if (!accessToken) return res.status(400).json({ error: "Access Token required" });
 
-  if (!accessToken) {
-    return res.status(400).json({ error: "Access Token required" });
-  }
-
-  // Google Auth
   const auth = new google.auth.OAuth2();
   auth.setCredentials({ access_token: accessToken });
   const gmail = google.gmail({ version: 'v1', auth });
 
   try {
-    console.log(`Processing emails for user: ${userId}`);
+    // 🕒 1. Get the last sync time from a dedicated 'users' metadata doc
+    // This avoids the complex "where + orderBy" query on 'job_applications'
+    const userRef = db.collection('users').doc(userId);
+    const userDoc = await userRef.get();
+    
+    let gmailQuery = '(shortlisted OR interview OR "congratulations") -label:trash -label:spam';
+    let lastSync = null;
 
-    const queryStr =
-      '(shortlisted OR congratulations OR interview OR "application update") ' +
-      '-label:trash -label:spam newer_than:30d';
+    if (userDoc.exists && userDoc.data().lastSync) {
+      lastSync = userDoc.data().lastSync;
+      const unixSeconds = Math.floor(lastSync.toDate().getTime() / 1000);
+      gmailQuery += ` after:${unixSeconds}`;
+    } else {
+      gmailQuery += ` newer_than:30d`;
+    }
 
+    console.log(`🔎 Initiating scan: ${gmailQuery}`);
+
+    // 2. 📧 Fetch messages
     const response = await gmail.users.messages.list({
       userId: 'me',
-      q: queryStr,
+      q: gmailQuery,
       maxResults: 15
     });
 
     const messages = response.data.messages || [];
-    const processedResults = [];
+    const results = [];
 
     if (messages.length === 0) {
-      return res.status(200).json({
-        message: "No relevant emails found",
-        results: []
-      });
+      console.log("✅ Scanning completed: No new emails found.");
+      
+      // Update the sync timestamp even if no emails found to mark the check time
+      await userRef.set({ lastSync: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      
+      return res.status(200).json({ message: "No new updates found", results: [] });
     }
 
-    /**
-     * This stores the last processed interview signature
-     * so we don’t create duplicate calendar events
-     */
-    let prevInterviewKey = "";
-
+    // 3. 🤖 AI Analysis Loop
     for (const msg of messages) {
-      const details = await gmail.users.messages.get({
-        userId: 'me',
-        id: msg.id
-      });
-
-      const snippet = details.data.snippet || "";
-      const lowerSnippet = snippet.toLowerCase();
-
-      let status = "Pending";
-      let calendarEvent = null;
-
-      const isShortlisted =
-        lowerSnippet.includes("congratulations") ||
-        lowerSnippet.includes("shortlisted") ||
-        lowerSnippet.includes("interview");
-
-      const isRejected =
-        lowerSnippet.includes("regret") ||
-        lowerSnippet.includes("not moving forward") ||
-        lowerSnippet.includes("thank you for your interest");
-
-      if (isShortlisted) {
-        status = "Shortlisted";
-
-        console.log(`Shortlisted email found (ID: ${msg.id})`);
-
-        // 🔹 Extract interview info via Gemini
-        const interviewData = await analyzeInterviewDetails(snippet);
-
-        if (interviewData && interviewData.date && interviewData.time) {
-          /**
-           * Create a stable comparison key
-           * (Object comparison is NOT reliable)
-           */
-          const interviewKey = `${interviewData.company || ""}_${interviewData.date}_${interviewData.time}`;
-
-          if (interviewKey !== prevInterviewKey) {
-            console.log("New interview detected. Creating calendar event...");
-
-            try {
-              const calResponse = await addToCalendar(auth, interviewData);
-              calendarEvent = calResponse.id;
-              prevInterviewKey = interviewKey;
-
-              console.log("Calendar event created:", calendarEvent);
-            } catch (calErr) {
-              console.error("Calendar creation failed:", calErr.message);
-            }
-          } else {
-            console.log("Duplicate interview detected. Skipping calendar creation.");
-          }
-        }
-      } else if (isRejected) {
-        status = "Rejected";
+      const email = await gmail.users.messages.get({ userId: 'me', id: msg.id });
+      const snippet = email.data.snippet;
+      
+      let body = "";
+      const payload = email.data.payload;
+      if (payload.parts) {
+        body = Buffer.from(payload.parts[0].body.data || "", 'base64').toString();
+      } else if (payload.body && payload.body.data) {
+        body = Buffer.from(payload.body.data, 'base64').toString();
       }
 
-      // Save to Firestore
-      const docData = {
-        userId: userId || "anonymous",
-        emailId: msg.id,
-        status,
-        snippet,
-        calendarId: calendarEvent,
-        processedAt: admin.firestore.FieldValue.serverTimestamp()
-      };
+      const contentToAnalyze = body.length > 10 ? body : snippet;
 
-      const docRef = await db.collection('job_applications').add(docData);
+      if (contentToAnalyze.toLowerCase().includes("interview")) {
+        const interviewData = await analyzeInterviewDetails(contentToAnalyze);
 
-      processedResults.push({
-        id: docRef.id,
-        status,
-        emailId: msg.id
-      });
+        if (interviewData) {
+          try {
+            const cal = await addToCalendar(auth, interviewData);
+            
+            await db.collection('job_applications').add({
+              userId,
+              company: interviewData.company,
+              status: "Shortlisted",
+              level: interviewData.level || "Interview",
+              snippet: snippet,
+              calendarId: cal.id,
+              processedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            results.push({ company: interviewData.company, status: "Synced" });
+          } catch (calErr) {
+            console.error(`❌ Calendar Error:`, calErr.message);
+          }
+        }
+      }
     }
 
-    res.status(200).json({
-      message: "Processing complete",
-      count: processedResults.length,
-      results: processedResults
-    });
+    // 4. ✅ Update the User's lastSync timestamp after a successful run
+    await userRef.set({ 
+      lastSync: admin.firestore.FieldValue.serverTimestamp() 
+    }, { merge: true });
 
-  } catch (error) {
-    console.error("Email Controller Error:", error);
-    res.status(500).json({
-      error: "Internal Server Error",
-      details: error.message
-    });
+    console.log(`✅ Scanning completed: Processed ${results.length} entries.`);
+    res.status(200).json({ message: `Processed ${results.length} updates`, results });
+
+  } catch (err) {
+    console.error("🚨 Controller Error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 };
 
-module.exports = { processUserEmails };
+module.exports = { processUserEmails }; 

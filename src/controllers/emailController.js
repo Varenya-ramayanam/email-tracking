@@ -16,56 +16,44 @@ const processUserEmails = async (req, res) => {
   const gmail = google.gmail({ version: 'v1', auth });
 
   try {
-    // 1. Get the specific user document
     const userRef = db.collection('users').doc(userId);
     const userDoc = await userRef.get();
     
     let gmailQuery = '(shortlisted OR interview OR "congratulations") -label:trash -label:spam';
     
-    // 2. Timezone-Agnostic Sync Logic
     if (userDoc.exists && userDoc.data().lastSync) {
       const lastSync = userDoc.data().lastSync;
-      
-      /**
-       * FIX: Timezone & Drift Buffer
-       * We subtract 6 hours (21600 seconds) from the stored UTC timestamp.
-       * This covers the 5.30h IST offset and provides a 30m safety window 
-       * to catch emails indexed late by Google.
-       */
-      const unixSeconds = Math.floor(lastSync.toDate().getTime() / 1000) - 21600;
+      // Keeping your logic: Subtracting 300 seconds (5 mins)
+      const unixSeconds = Math.floor(lastSync.toDate().getTime() / 1000) - 300;
       gmailQuery += ` after:${unixSeconds}`;
     } else {
-      // First time user: Scan last 30 days
       gmailQuery += ` newer_than:30d`;
     }
 
-    console.log(`🔎 Running Sync for ${userId} | Query: ${gmailQuery}`);
+    // CRITICAL FOR PROD: Log the exact query to check if the timestamp is in the future
+    console.log(`🔎 PROD QUERY for ${userId}: ${gmailQuery}`);
 
-    // 3. Fetch messages from Gmail
     const response = await gmail.users.messages.list({
       userId: 'me',
       q: gmailQuery,
-      maxResults: 15
+      maxResults: 5
     });
 
     const messages = response.data.messages || [];
     const results = [];
 
-    // Update timestamp immediately to mark this attempt
     const currentSyncTimestamp = admin.firestore.FieldValue.serverTimestamp();
 
     if (messages.length === 0) {
-      console.log(`ℹ️ No new emails found for user ${userId}`);
+      console.log(`ℹ️ Gmail returned 0 messages for query: ${gmailQuery}`);
       await userRef.set({ lastSync: currentSyncTimestamp }, { merge: true });
       return res.status(200).json({ message: "No new updates found", results: [] });
     }
 
-    // 4. Processing Loop
     for (const msg of messages) {
       try {
         const email = await gmail.users.messages.get({ userId: 'me', id: msg.id });
         
-        // Extract email body safely
         let body = "";
         const payload = email.data.payload;
         if (payload.parts) {
@@ -77,17 +65,15 @@ const processUserEmails = async (req, res) => {
         const snippet = email.data.snippet;
         const contentToAnalyze = body.length > 10 ? body : snippet;
 
-        // Preliminary check to save AI tokens
         if (contentToAnalyze.toLowerCase().includes("interview") || 
             contentToAnalyze.toLowerCase().includes("shortlisted")) {
           
+          // If GEMINI_API_KEY is missing in prod, this will throw an error
           const interviewData = await analyzeInterviewDetails(contentToAnalyze);
 
           if (interviewData) {
-            // Add to Calendar
             const cal = await addToCalendar(auth, interviewData);
             
-            // Log application to Firestore
             await db.collection('job_applications').add({
               userId,
               company: interviewData.company,
@@ -102,14 +88,13 @@ const processUserEmails = async (req, res) => {
           }
         }
       } catch (innerErr) {
-        console.error(`⚠️ Error processing email ${msg.id}:`, innerErr.message);
+        // Logs exactly which email failed and why
+        console.error(`⚠️ Email processing error [${msg.id}]:`, innerErr.message);
       }
     }
 
-    // 5. Finalize: Update lastSync
     await userRef.set({ lastSync: currentSyncTimestamp }, { merge: true });
 
-    console.log(`✅ Sync Complete for ${userId}: Found ${results.length} items.`);
     res.status(200).json({ 
       success: true,
       message: `Processed ${results.length} updates`, 
@@ -117,7 +102,8 @@ const processUserEmails = async (req, res) => {
     });
 
   } catch (err) {
-    console.error("🚨 Cloud Production Error:", err.message);
+    // In Production, this will tell you if it's a 401 Unauthorized or 403 Forbidden
+    console.error("🚨 PROD FATAL ERROR:", err);
     res.status(500).json({ 
       error: "Internal Server Error", 
       details: err.message 

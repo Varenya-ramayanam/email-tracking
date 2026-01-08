@@ -6,32 +6,36 @@ const { addToCalendar } = require('../services/calendarService');
 
 const processUserEmails = async (req, res) => {
   const { accessToken, userId } = req.body;
-  if (!accessToken) return res.status(400).json({ error: "Access Token required" });
+
+  if (!accessToken || !userId) {
+    return res.status(400).json({ error: "Access Token and UserID are required" });
+  }
 
   const auth = new google.auth.OAuth2();
   auth.setCredentials({ access_token: accessToken });
   const gmail = google.gmail({ version: 'v1', auth });
 
   try {
-    // 🕒 1. Get the last sync time from a dedicated 'users' metadata doc
-    // This avoids the complex "where + orderBy" query on 'job_applications'
+    // 1. Get the specific user's document for their unique sync time
     const userRef = db.collection('users').doc(userId);
     const userDoc = await userRef.get();
     
     let gmailQuery = '(shortlisted OR interview OR "congratulations") -label:trash -label:spam';
-    let lastSync = null;
-
+    
+    // 2. Logic: Search only AFTER the last time THIS user synced
     if (userDoc.exists && userDoc.data().lastSync) {
-      lastSync = userDoc.data().lastSync;
+      const lastSync = userDoc.data().lastSync;
+      // Convert Firestore Timestamp to Unix Seconds for Gmail's 'after:' filter
       const unixSeconds = Math.floor(lastSync.toDate().getTime() / 1000);
       gmailQuery += ` after:${unixSeconds}`;
     } else {
+      // Fallback for new users: scan last 30 days
       gmailQuery += ` newer_than:30d`;
     }
 
-    console.log(`🔎 Initiating scan: ${gmailQuery}`);
+    console.log(`🔎 User [${userId}] Scan: ${gmailQuery}`);
 
-    // 2. 📧 Fetch messages
+    // 3. Fetch messages based on user-specific query
     const response = await gmail.users.messages.list({
       userId: 'me',
       q: gmailQuery,
@@ -41,19 +45,17 @@ const processUserEmails = async (req, res) => {
     const messages = response.data.messages || [];
     const results = [];
 
+    // If no new emails, update timestamp anyway to mark the "last checked" time
     if (messages.length === 0) {
-      console.log("✅ Scanning completed: No new emails found.");
-      
-      // Update the sync timestamp even if no emails found to mark the check time
-      await userRef.set({ lastSync: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-      
+      await userRef.set({ 
+        lastSync: admin.firestore.FieldValue.serverTimestamp() 
+      }, { merge: true });
       return res.status(200).json({ message: "No new updates found", results: [] });
     }
 
-    // 3. 🤖 AI Analysis Loop
+    // 4. Processing Loop
     for (const msg of messages) {
       const email = await gmail.users.messages.get({ userId: 'me', id: msg.id });
-      const snippet = email.data.snippet;
       
       let body = "";
       const payload = email.data.payload;
@@ -63,8 +65,10 @@ const processUserEmails = async (req, res) => {
         body = Buffer.from(payload.body.data, 'base64').toString();
       }
 
+      const snippet = email.data.snippet;
       const contentToAnalyze = body.length > 10 ? body : snippet;
 
+      // Basic filter to save AI processing credits
       if (contentToAnalyze.toLowerCase().includes("interview")) {
         const interviewData = await analyzeInterviewDetails(contentToAnalyze);
 
@@ -72,6 +76,7 @@ const processUserEmails = async (req, res) => {
           try {
             const cal = await addToCalendar(auth, interviewData);
             
+            // Add to job_applications collection with the userId
             await db.collection('job_applications').add({
               userId,
               company: interviewData.company,
@@ -84,18 +89,17 @@ const processUserEmails = async (req, res) => {
 
             results.push({ company: interviewData.company, status: "Synced" });
           } catch (calErr) {
-            console.error(`❌ Calendar Error:`, calErr.message);
+            console.error(`❌ Calendar Error for ${userId}:`, calErr.message);
           }
         }
       }
     }
 
-    // 4. ✅ Update the User's lastSync timestamp after a successful run
+    // 5. Success! Update the user's specific lastSync timestamp
     await userRef.set({ 
       lastSync: admin.firestore.FieldValue.serverTimestamp() 
     }, { merge: true });
 
-    console.log(`✅ Scanning completed: Processed ${results.length} entries.`);
     res.status(200).json({ message: `Processed ${results.length} updates`, results });
 
   } catch (err) {
@@ -104,4 +108,5 @@ const processUserEmails = async (req, res) => {
   }
 };
 
-module.exports = { processUserEmails }; 
+// CRITICAL: Ensure this export matches your import in app.js
+module.exports = { processUserEmails };

@@ -20,33 +20,39 @@ const processUserEmails = async (req, res) => {
     const userDoc = await userRef.get();
     
     let gmailQuery = '(shortlisted OR interview OR "congratulations") -label:trash -label:spam';
-    
+     
     if (userDoc.exists && userDoc.data().lastSync) {
       const lastSync = userDoc.data().lastSync;
-      // Keeping your logic: Subtracting 300 seconds (5 mins)
-      const unixSeconds = Math.floor(lastSync.toDate().getTime() / 1000) - 300;
+      
+      // LOGGING FOR YOU: See the last sync in IST to verify logic
+      const lastSyncIST = lastSync.toDate().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+      console.log(`🕒 Database LastSync (IST): ${lastSyncIST}`);
+
+      /**
+       * THE FIX: 30,000 second buffer (~8.3 hours)
+       * IST is UTC +5.5. By subtracting 8+ hours, we ensure the "after:" 
+       * timestamp is ALWAYS in the past, even if the server is in the US/Europe.
+       */
+      const unixSeconds = Math.floor(lastSync.toDate().getTime() / 1000) - 30000;
       gmailQuery += ` after:${unixSeconds}`;
     } else {
       gmailQuery += ` newer_than:30d`;
     }
 
-    // CRITICAL FOR PROD: Log the exact query to check if the timestamp is in the future
-    console.log(`🔎 PROD QUERY for ${userId}: ${gmailQuery}`);
+    console.log(`🔎 PROD SYNC | Query: ${gmailQuery}`);
 
     const response = await gmail.users.messages.list({
       userId: 'me',
       q: gmailQuery,
-      maxResults: 5
+      maxResults: 15
     });
 
     const messages = response.data.messages || [];
     const results = [];
 
-    const currentSyncTimestamp = admin.firestore.FieldValue.serverTimestamp();
-
+    // Atomic Sync: If nothing found, don't update lastSync to prevent "Future Locking"
     if (messages.length === 0) {
-      console.log(`ℹ️ Gmail returned 0 messages for query: ${gmailQuery}`);
-      await userRef.set({ lastSync: currentSyncTimestamp }, { merge: true });
+      console.log(`ℹ️ No new emails found. Keeping window open.`);
       return res.status(200).json({ message: "No new updates found", results: [] });
     }
 
@@ -68,7 +74,6 @@ const processUserEmails = async (req, res) => {
         if (contentToAnalyze.toLowerCase().includes("interview") || 
             contentToAnalyze.toLowerCase().includes("shortlisted")) {
           
-          // If GEMINI_API_KEY is missing in prod, this will throw an error
           const interviewData = await analyzeInterviewDetails(contentToAnalyze);
 
           if (interviewData) {
@@ -88,12 +93,14 @@ const processUserEmails = async (req, res) => {
           }
         }
       } catch (innerErr) {
-        // Logs exactly which email failed and why
-        console.error(`⚠️ Email processing error [${msg.id}]:`, innerErr.message);
+        console.error(`⚠️ Error processing email ${msg.id}:`, innerErr.message);
       }
     }
 
-    await userRef.set({ lastSync: currentSyncTimestamp }, { merge: true });
+    // ONLY update the timestamp if we successfully finished the loop
+    await userRef.set({ 
+      lastSync: admin.firestore.FieldValue.serverTimestamp() 
+    }, { merge: true });
 
     res.status(200).json({ 
       success: true,
@@ -102,12 +109,8 @@ const processUserEmails = async (req, res) => {
     });
 
   } catch (err) {
-    // In Production, this will tell you if it's a 401 Unauthorized or 403 Forbidden
     console.error("🚨 PROD FATAL ERROR:", err);
-    res.status(500).json({ 
-      error: "Internal Server Error", 
-      details: err.message 
-    });
+    res.status(500).json({ error: "Internal Server Error", details: err.message });
   }
 };
 
